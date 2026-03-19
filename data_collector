@@ -1,0 +1,113 @@
+import fastf1
+import pandas as pd
+import os
+import numpy as np
+import time
+from tqdm import tqdm  # type: ignore
+
+# --- CONFIGURATION ---
+BASE_PATH = r"D:\F1_data"
+CACHE_DIR = os.path.join(BASE_PATH, "f1_cache")
+OUTPUT_FILE = os.path.join(BASE_PATH, "f1_strategic_master_22_25.parquet") # Updated filename
+
+if not os.path.exists(BASE_PATH):
+    os.makedirs(BASE_PATH)
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
+fastf1.Cache.enable_cache(CACHE_DIR)
+
+# [UPGRADE 1]: Added 2025 Season
+SEASONS = [2022, 2023, 2024, 2025]
+
+def get_merged_weather(session, laps):
+    """Merges Track, Air, and Wind telemetry precisely to each lap time."""
+    weather_data = session.weather_data
+    if weather_data.empty:
+        return laps 
+        
+    laps['Time_Sec'] = laps['Time'].dt.total_seconds()
+    weather_data['Time_Sec'] = weather_data['Time'].dt.total_seconds()
+    
+    laps = laps.sort_values('Time_Sec')
+    weather_data = weather_data.sort_values('Time_Sec')
+    
+    # [UPGRADE 2]: Added WindSpeed and WindDirection for aero/cooling features
+    merged = pd.merge_asof(
+        laps, 
+        weather_data[['Time_Sec', 'TrackTemp', 'AirTemp', 'Rainfall', 'WindSpeed', 'WindDirection']], 
+        on='Time_Sec', 
+        direction='backward'
+    )
+    return merged
+
+def collect_thesis_data():
+    all_race_data = []
+    
+    for year in SEASONS:
+        print(f"\n>>> Initializing Season {year}")
+        
+        try:
+            schedule = fastf1.get_event_schedule(year)
+        except Exception as e:
+            print(f"CRITICAL ERROR: Could not load schedule for {year}. F1 API might be down. Error: {e}")
+            continue
+
+        races = schedule[schedule['EventFormat'] == 'conventional']
+        
+        for _, race in tqdm(races.iterrows(), total=len(races), desc=f"Processing {year} Races"):
+            try:
+                session = fastf1.get_session(year, race['RoundNumber'], 'R')
+                session.load(telemetry=False, weather=True)
+                
+                if session.laps is None or session.laps.empty:
+                    print(f"  -> No lap data for {year} Round {race['RoundNumber']}. Skipping.")
+                    continue
+                    
+                laps = session.laps.copy()
+                
+                if session.results is not None and not session.results.empty:
+                    results = session.results[['DriverNumber', 'TeamName', 'ClassifiedPosition']]
+                    laps = laps.merge(results, on='DriverNumber', how='left')
+                else:
+                    laps['TeamName'] = "Unknown"
+                    laps['ClassifiedPosition'] = np.nan
+                
+                # Metadata
+                laps['Season'] = year
+                laps['RoundNumber'] = race['RoundNumber']
+                laps['Track'] = race['Location']
+                
+                # Weather merge
+                laps_with_weather = get_merged_weather(session, laps)
+                
+                # [UPGRADE 3]: Explicitly capture Safety Car / VSC conditions
+                # FastF1 TrackStatus: '1'=Clear, '4'=SC, '5'=Red, '6'=VSC, '7'=VSC Ending
+                laps_with_weather['Is_Safety_Car'] = laps_with_weather['TrackStatus'].astype(str).str.contains('4|6|7')
+                
+                # [UPGRADE 4]: Ensure critical tire metadata is properly formatted
+                if 'FreshTyre' in laps_with_weather.columns:
+                    laps_with_weather['FreshTyre'] = laps_with_weather['FreshTyre'].fillna(False).astype(bool)
+                else:
+                    laps_with_weather['FreshTyre'] = False
+                
+                # Target variable flag
+                laps_with_weather['IsPitStop'] = ~laps_with_weather['PitOutTime'].isna()
+                
+                all_race_data.append(laps_with_weather)
+                
+            except Exception as e:
+                print(f"\nSkipping {year} Round {race['RoundNumber']} ({race['EventName']}) due to error: {e}")
+            
+            time.sleep(3)
+
+    if all_race_data:
+        final_df = pd.concat(all_race_data, ignore_index=True)
+        final_df.to_parquet(OUTPUT_FILE, index=False)
+        print(f"\n[SUCCESS] Master Dataset securely saved to: {OUTPUT_FILE}")
+        print(f"[STATS] Total Laps Collected: {len(final_df)}")
+    else:
+        print("\n[FAILED] No data collected. Please verify your connection.")
+
+if __name__ == "__main__":
+    collect_thesis_data()
